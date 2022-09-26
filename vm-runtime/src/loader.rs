@@ -433,117 +433,92 @@ impl ModuleCache {
 // Loader
 //
 
-// A Loader is responsible to load scripts and modules and holds the cache of all loaded
-// entities. Each cache is protected by a `RwLock`. Operation in the Loader must be thread safe
-// (operating on values on the stack) and when cache needs updating the mutex must be taken.
-// The `pub(crate)` API is what a Loader offers to the runtime.
-pub(crate) struct Loader {
-    scripts: RwLock<ScriptCache>,
-    module_cache: RwLock<ModuleCache>,
-    type_cache: RwLock<TypeCache>,
-    natives: NativeFunctions,
+// pub(crate) struct Loader {
+// scripts: RwLock<ScriptCache>,
+// module_cache: RwLock<ModuleCache>,
+// type_cache: RwLock<TypeCache>,
+// natives: NativeFunctions,
 
-    // The below field supports a hack to workaround well-known issues with the
-    // loader cache. This cache is not designed to support module upgrade or deletion.
-    // This leads to situations where the cache does not reflect the state of storage:
-    //
-    // 1. On module upgrade, the upgraded module is in storage, but the old one still in the cache.
-    // 2. On an abandoned code publishing transaction, the cache may contain a module which was
-    //    never committed to storage by the adapter.
-    //
-    // The solution is to add a flag to Loader marking it as 'invalidated'. For scenario (1),
-    // the VM sets the flag itself. For scenario (2), a public API allows the adapter to set
-    // the flag.
-    //
-    // If the cache is invalidated, it can (and must) still be used until there are no more
-    // sessions alive which are derived from a VM with this loader. This is because there are
-    // internal data structures derived from the loader which can become inconsistent. Therefore
-    // the adapter must explicitly call a function to flush the invalidated loader.
-    //
-    // This code (the loader) needs a complete refactoring. The new loader should
-    //
-    // - support upgrade and deletion of modules, while still preserving max cache lookup
-    //   performance. This is essential for a cache like this in a multi-tenant execution
-    //   environment.
-    // - should delegate lifetime ownership to the adapter. Code loading (including verification)
-    //   is a major execution bottleneck. We should be able to reuse a cache for the lifetime of
-    //   the adapter/node, not just a VM or even session (as effectively today).
-    invalidated: RwLock<bool>,
+// The below field supports a hack to workaround well-known issues with the
+// loader cache. This cache is not designed to support module upgrade or deletion.
+// This leads to situations where the cache does not reflect the state of storage:
+//
+// 1. On module upgrade, the upgraded module is in storage, but the old one still in the cache.
+// 2. On an abandoned code publishing transaction, the cache may contain a module which was
+//    never committed to storage by the adapter.
+//
+// The solution is to add a flag to Loader marking it as 'invalidated'. For scenario (1),
+// the VM sets the flag itself. For scenario (2), a public API allows the adapter to set
+// the flag.
+//
+// If the cache is invalidated, it can (and must) still be used until there are no more
+// sessions alive which are derived from a VM with this loader. This is because there are
+// internal data structures derived from the loader which can become inconsistent. Therefore
+// the adapter must explicitly call a function to flush the invalidated loader.
+//
+// This code (the loader) needs a complete refactoring. The new loader should
+//
+// - support upgrade and deletion of modules, while still preserving max cache lookup
+//   performance. This is essential for a cache like this in a multi-tenant execution
+//   environment.
+// - should delegate lifetime ownership to the adapter. Code loading (including verification)
+//   is a major execution bottleneck. We should be able to reuse a cache for the lifetime of
+//   the adapter/node, not just a VM or even session (as effectively today).
+// invalidated: RwLock<bool>,
 
-    // Collects the cache hits on module loads. This information can be read and reset by
-    // an adapter to reason about read/write conflicts of code publishing transactions and
-    // other transactions.
-    module_cache_hits: RwLock<BTreeSet<ModuleId>>,
+// Collects the cache hits on module loads. This information can be read and reset by
+// an adapter to reason about read/write conflicts of code publishing transactions and
+// other transactions.
+// module_cache_hits: RwLock<BTreeSet<ModuleId>>,
 
-    verifier_config: VerifierConfig,
-}
+// verifier_config: VerifierConfig,
+// }
 
-impl Loader {
-    pub(crate) fn new(natives: NativeFunctions, verifier_config: VerifierConfig) -> Self {
-        Self {
-            scripts: RwLock::new(ScriptCache::new()),
-            module_cache: RwLock::new(ModuleCache::new()),
-            type_cache: RwLock::new(TypeCache::new()),
-            natives,
-            invalidated: RwLock::new(false),
-            module_cache_hits: RwLock::new(BTreeSet::new()),
-            verifier_config,
-        }
-    }
-
+pub trait Loader {
+    type Types;
+    type Modules;
+    type Natives;
+    type Scripts;
     /// Gets and clears module cache hits. A cache hit may also be caused indirectly by
     /// loading a function or a type. This not only returns the direct hit, but also
     /// indirect ones, that is all dependencies.
-    pub(crate) fn get_and_clear_module_cache_hits(&self) -> BTreeSet<ModuleId> {
-        let mut result = BTreeSet::new();
-        let hits: BTreeSet<ModuleId> = std::mem::take(&mut self.module_cache_hits.write());
-        for id in hits {
-            self.transitive_dep_closure(&id, &mut result)
-        }
-        result
-    }
+    // pub(crate) fn get_and_clear_module_cache_hits(&self) -> BTreeSet<ModuleId> {
+    //     let mut result = BTreeSet::new();
+    //     let hits: BTreeSet<ModuleId> = std::mem::take(&mut self.module_cache_hits.write());
+    //     for id in hits {
+    //         self.transitive_dep_closure(&id, &mut result)
+    //     }
+    //     result
+    // }
 
-    fn transitive_dep_closure(&self, id: &ModuleId, visited: &mut BTreeSet<ModuleId>) {
+    fn transitive_dep_closure(id: &ModuleId, visited: &mut BTreeSet<ModuleId>) {
         if !visited.insert(id.clone()) {
             return;
         }
-        let deps = self
-            .module_cache
-            .read()
-            .modules
-            .get(id)
-            .unwrap()
-            .module
-            .immediate_dependencies();
-        for dep in deps {
-            self.transitive_dep_closure(&dep, visited)
-        }
-    }
-
-    /// Flush this cache if it is marked as invalidated.
-    pub(crate) fn flush_if_invalidated(&self) {
-        let mut invalidated = self.invalidated.write();
-        if *invalidated {
-            *self.scripts.write() = ScriptCache::new();
-            *self.module_cache.write() = ModuleCache::new();
-            *self.type_cache.write() = TypeCache::new();
-            *invalidated = false;
-        }
-    }
-
-    /// Mark this cache as invalidated.
-    pub(crate) fn mark_as_invalid(&self) {
-        *self.invalidated.write() = true;
+        // TODO rewrite by traveling all modules
+        // let deps = self
+        //     .module_cache
+        //     .read()
+        //     .modules
+        //     .get(id)
+        //     .unwrap()
+        //     .module
+        //     .immediate_dependencies();
+        // for dep in deps {
+        //     self.transitive_dep_closure(&dep, visited)
+        // }
     }
 
     /// Copies metadata out of a modules bytecode if available.
-    pub(crate) fn get_metadata(&self, module: ModuleId, key: &[u8]) -> Option<Metadata> {
-        let cache = self.module_cache.read();
-        cache
-            .modules
-            .get(&module)
-            .and_then(|module| module.module.metadata.iter().find(|md| md.key == key))
-            .cloned()
+    fn get_metadata(module: ModuleId, key: &[u8]) -> Option<Metadata> {
+        // TODO rewrite
+        None
+        // let cache = self.module_cache.read();
+        // cache
+        //     .modules
+        //     .get(&module)
+        //     .and_then(|module| module.module.metadata.iter().find(|md| md.key == key))
+        //     .cloned()
     }
 
     //
@@ -1270,40 +1245,17 @@ impl Loader {
 }
 
 //
-// Resolver
+// replace Resolver
 //
 
-// A simple wrapper for a `Module` or a `Script` in the `Resolver`
-enum BinaryType {
+pub enum BinaryType {
     Module(Arc<Module>),
     Script(Arc<Script>),
 }
 
-// A Resolver is a simple and small structure allocated on the stack and used by the
-// interpreter. It's the only API known to the interpreter and it's tailored to the interpreter
-// needs.
-pub(crate) struct Resolver<'a> {
-    loader: &'a Loader,
-    binary: BinaryType,
-}
-
-impl<'a> Resolver<'a> {
-    fn for_module(loader: &'a Loader, module: Arc<Module>) -> Self {
-        let binary = BinaryType::Module(module);
-        Self { loader, binary }
-    }
-
-    fn for_script(loader: &'a Loader, script: Arc<Script>) -> Self {
-        let binary = BinaryType::Script(script);
-        Self { loader, binary }
-    }
-
-    //
-    // Constant resolution
-    //
-
+impl BinaryType {
     pub(crate) fn constant_at(&self, idx: ConstantPoolIndex) -> &Constant {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.module.constant_at(idx),
             BinaryType::Script(script) => script.script.constant_at(idx),
         }
@@ -1313,23 +1265,26 @@ impl<'a> Resolver<'a> {
     // Function resolution
     //
 
-    pub(crate) fn function_from_handle(&self, idx: FunctionHandleIndex) -> Arc<Function> {
-        let idx = match &self.binary {
+    pub(crate) fn function_from_handle<L: Loader>(
+        &self,
+        idx: FunctionHandleIndex,
+    ) -> Arc<Function> {
+        let idx = match self {
             BinaryType::Module(module) => module.function_at(idx.0),
             BinaryType::Script(script) => script.function_at(idx.0),
         };
-        self.loader.function_at(idx)
+        L::function_at(idx)
     }
 
-    pub(crate) fn function_from_instantiation(
+    pub(crate) fn function_from_instantiation<L: Loader>(
         &self,
         idx: FunctionInstantiationIndex,
     ) -> Arc<Function> {
-        let func_inst = match &self.binary {
+        let func_inst = match self {
             BinaryType::Module(module) => module.function_instantiation_at(idx.0),
             BinaryType::Script(script) => script.function_instantiation_at(idx.0),
         };
-        self.loader.function_at(func_inst.handle)
+        L::function_at(func_inst.handle)
     }
 
     pub(crate) fn instantiate_generic_function(
@@ -1337,7 +1292,7 @@ impl<'a> Resolver<'a> {
         idx: FunctionInstantiationIndex,
         type_params: &[Type],
     ) -> PartialVMResult<Vec<Type>> {
-        let func_inst = match &self.binary {
+        let func_inst = match self {
             BinaryType::Module(module) => module.function_instantiation_at(idx.0),
             BinaryType::Script(script) => script.function_instantiation_at(idx.0),
         };
@@ -1350,7 +1305,7 @@ impl<'a> Resolver<'a> {
 
     #[allow(unused)]
     pub(crate) fn type_params_count(&self, idx: FunctionInstantiationIndex) -> usize {
-        let func_inst = match &self.binary {
+        let func_inst = match self {
             BinaryType::Module(module) => module.function_instantiation_at(idx.0),
             BinaryType::Script(script) => script.function_instantiation_at(idx.0),
         };
@@ -1362,7 +1317,7 @@ impl<'a> Resolver<'a> {
     //
 
     pub(crate) fn get_struct_type(&self, idx: StructDefinitionIndex) -> Type {
-        let struct_def = match &self.binary {
+        let struct_def = match self {
             BinaryType::Module(module) => module.struct_at(idx),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         };
@@ -1374,7 +1329,7 @@ impl<'a> Resolver<'a> {
         idx: StructDefInstantiationIndex,
         ty_args: &[Type],
     ) -> PartialVMResult<Type> {
-        let struct_inst = match &self.binary {
+        let struct_inst = match self {
             BinaryType::Module(module) => module.struct_instantiation_at(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         };
@@ -1389,7 +1344,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn single_type_at(&self, idx: SignatureIndex) -> &Type {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.single_type_at(idx),
             BinaryType::Script(script) => script.single_type_at(idx),
         }
@@ -1409,40 +1364,38 @@ impl<'a> Resolver<'a> {
     //
 
     pub(crate) fn field_offset(&self, idx: FieldHandleIndex) -> usize {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.field_offset(idx),
             BinaryType::Script(_) => unreachable!("Scripts cannot have field instructions"),
         }
     }
 
     pub(crate) fn field_instantiation_offset(&self, idx: FieldInstantiationIndex) -> usize {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.field_instantiation_offset(idx),
             BinaryType::Script(_) => unreachable!("Scripts cannot have field instructions"),
         }
     }
 
     pub(crate) fn field_count(&self, idx: StructDefinitionIndex) -> u16 {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.field_count(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         }
     }
 
     pub(crate) fn field_instantiation_count(&self, idx: StructDefInstantiationIndex) -> u16 {
-        match &self.binary {
+        match self {
             BinaryType::Module(module) => module.field_instantiation_count(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         }
     }
 
-    pub(crate) fn type_to_type_layout(&self, ty: &Type) -> PartialVMResult<MoveTypeLayout> {
-        self.loader.type_to_type_layout(ty)
-    }
-
-    // get the loader
-    pub(crate) fn loader(&self) -> &Loader {
-        self.loader
+    pub(crate) fn type_to_type_layout<L: Loader>(
+        &self,
+        ty: &Type,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        L::type_to_type_layout(ty)
     }
 }
 
@@ -2022,16 +1975,10 @@ impl Function {
         self.index
     }
 
-    pub(crate) fn get_resolver<'a>(&self, loader: &'a Loader) -> Resolver<'a> {
+    pub(crate) fn get_binary_type<L: Loader>(&self) -> BinaryType {
         match &self.scope {
-            Scope::Module(module_id) => {
-                let module = loader.get_module(module_id);
-                Resolver::for_module(loader, module)
-            }
-            Scope::Script(script_hash) => {
-                let script = loader.get_script(script_hash);
-                Resolver::for_script(loader, script)
-            }
+            Scope::Module(module_id) => BinaryType::Module(L::get_module(module_id)),
+            Scope::Script(script_hash) => BinaryType::Script(L::get_script(script_hash)),
         }
     }
 
@@ -2099,7 +2046,6 @@ impl Function {
 // execution information (interpreter).
 // The following structs are internal to the loader and never exposed out.
 // The `Loader` will create those struct and the proper table when loading a module.
-// The `Resolver` uses those structs to return information to the `Interpreter`.
 //
 
 // A function instantiation.

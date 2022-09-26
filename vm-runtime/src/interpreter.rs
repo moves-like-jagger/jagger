@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    loader::{Function, Loader, Resolver},
+    loader::{Function, Loader},
     native_extensions::NativeContextExtensions,
     native_functions::NativeContext,
     trace,
@@ -109,7 +109,6 @@ impl Interpreter {
     /// Internal execution entry point.
     fn execute<L: Loader>(
         &mut self,
-        loader: &Loader,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
         extensions: &mut NativeContextExtensions,
@@ -148,10 +147,12 @@ impl Interpreter {
 
         let mut current_frame = Frame::new(function, ty_args, locals);
         loop {
-            let resolver = current_frame.resolver(loader);
-            let exit_code = current_frame //self
-                .execute_code(&resolver, self, data_store, gas_meter)
-                .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
+            // change to binary_type
+            let binary_type = current_frame.binary_type::<L>();
+            let exit_code =
+                current_frame //self
+                    .execute_code(&binary_type, self, data_store, gas_meter)
+                    .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
             match exit_code {
                 ExitCode::Return => {
                     if let Some(frame) = self.call_stack.pop() {
@@ -162,7 +163,7 @@ impl Interpreter {
                     }
                 }
                 ExitCode::Call(fh_idx) => {
-                    let func = resolver.function_from_handle(fh_idx);
+                    let func = binary_type.function_from_handle(fh_idx);
 
                     // Charge gas
                     let module_id = func
@@ -184,7 +185,7 @@ impl Interpreter {
 
                     if func.is_native() {
                         self.call_native(
-                            &resolver,
+                            &binary_type,
                             data_store,
                             gas_meter,
                             extensions,
@@ -206,10 +207,10 @@ impl Interpreter {
                 }
                 ExitCode::CallGeneric(idx) => {
                     // TODO(Gas): We should charge gas as we do type substitution...
-                    let ty_args = resolver
+                    let ty_args = binary_type
                         .instantiate_generic_function(idx, current_frame.ty_args())
                         .map_err(|e| set_err_info!(current_frame, e))?;
-                    let func = resolver.function_from_instantiation(idx);
+                    let func = binary_type.function_from_instantiation(idx);
 
                     // Charge gas
                     let module_id = func
@@ -232,7 +233,12 @@ impl Interpreter {
 
                     if func.is_native() {
                         self.call_native(
-                            &resolver, data_store, gas_meter, extensions, func, ty_args,
+                            &binary_type,
+                            data_store,
+                            gas_meter,
+                            extensions,
+                            func,
+                            ty_args,
                         )?;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
                         continue;
@@ -273,7 +279,7 @@ impl Interpreter {
     /// Call a native functions.
     fn call_native(
         &mut self,
-        resolver: &Resolver,
+        binary_type: &BinaryType,
         data_store: &mut dyn DataStore,
         gas_meter: &mut impl GasMeter,
         extensions: &mut NativeContextExtensions,
@@ -282,7 +288,7 @@ impl Interpreter {
     ) -> VMResult<()> {
         // Note: refactor if native functions push a frame on the stack
         self.call_native_impl(
-            resolver,
+            binary_type,
             data_store,
             gas_meter,
             extensions,
@@ -303,7 +309,7 @@ impl Interpreter {
 
     fn call_native_impl(
         &mut self,
-        resolver: &Resolver,
+        binary_type: &BinaryType,
         data_store: &mut dyn DataStore,
         gas_meter: &mut impl GasMeter,
         extensions: &mut NativeContextExtensions,
@@ -315,7 +321,8 @@ impl Interpreter {
         for _ in 0..expected_args {
             args.push_front(self.operand_stack.pop()?);
         }
-        let mut native_context = NativeContext::new(self, data_store, resolver, extensions);
+        // TODO didn't update the NativeContext
+        let mut native_context = NativeContext::new(self, data_store, binary_type, extensions);
         let native_function = function.get_native()?;
 
         let result = native_function(&mut native_context, ty_args, args)?;
@@ -390,32 +397,25 @@ impl Interpreter {
     }
 
     /// BorrowGlobal (mutable and not) opcode.
-    fn borrow_global(
+    fn borrow_global<L: Loader>(
         &mut self,
         is_mut: bool,
         is_generic: bool,
-        loader: &Loader,
         gas_meter: &mut impl GasMeter,
         data_store: &mut impl DataStore,
         addr: AccountAddress,
         ty: &Type,
     ) -> PartialVMResult<()> {
         let res = Self::load_resource(gas_meter, data_store, addr, ty)?.borrow_global();
-        gas_meter.charge_borrow_global(
-            is_mut,
-            is_generic,
-            TypeWithLoader { ty, loader },
-            res.is_ok(),
-        )?;
+        gas_meter.charge_borrow_global::<L>(is_mut, is_generic, ty, res.is_ok())?;
         self.operand_stack.push(res?)?;
         Ok(())
     }
 
     /// Exists opcode.
-    fn exists(
+    fn exists<L: Loader>(
         &mut self,
         is_generic: bool,
-        loader: &Loader,
         gas_meter: &mut impl GasMeter,
         data_store: &mut impl DataStore,
         addr: AccountAddress,
@@ -423,16 +423,15 @@ impl Interpreter {
     ) -> PartialVMResult<()> {
         let gv = Self::load_resource(gas_meter, data_store, addr, ty)?;
         let exists = gv.exists()?;
-        gas_meter.charge_exists(is_generic, TypeWithLoader { ty, loader }, exists)?;
+        gas_meter.charge_exists::<L>(is_generic, ty, exists)?;
         self.operand_stack.push(Value::bool(exists))?;
         Ok(())
     }
 
     /// MoveFrom opcode.
-    fn move_from(
+    fn move_from<L: Loader>(
         &mut self,
         is_generic: bool,
-        loader: &Loader,
         gas_meter: &mut impl GasMeter,
         data_store: &mut impl DataStore,
         addr: AccountAddress,
@@ -440,16 +439,12 @@ impl Interpreter {
     ) -> PartialVMResult<()> {
         let resource = match Self::load_resource(gas_meter, data_store, addr, ty)?.move_from() {
             Ok(resource) => {
-                gas_meter.charge_move_from(
-                    is_generic,
-                    TypeWithLoader { ty, loader },
-                    Some(&resource),
-                )?;
+                gas_meter.charge_move_from::<L>(is_generic, ty, Some(&resource))?;
                 resource
             }
             Err(err) => {
                 let val: Option<&Value> = None;
-                gas_meter.charge_move_from(is_generic, TypeWithLoader { ty, loader }, val)?;
+                gas_meter.charge_move_from::<L>(is_generic, ty, val)?;
                 return Err(err);
             }
         };
@@ -458,10 +453,9 @@ impl Interpreter {
     }
 
     /// MoveTo opcode.
-    fn move_to(
+    fn move_to<L: Loader>(
         &mut self,
         is_generic: bool,
-        loader: &Loader,
         gas_meter: &mut impl GasMeter,
         data_store: &mut impl DataStore,
         addr: AccountAddress,
@@ -473,21 +467,11 @@ impl Interpreter {
         //            the move_to operation.
         match gv.move_to(resource) {
             Ok(()) => {
-                gas_meter.charge_move_to(
-                    is_generic,
-                    TypeWithLoader { ty, loader },
-                    gv.view().unwrap(),
-                    true,
-                )?;
+                gas_meter.charge_move_to::<L>(is_generic, ty, gv.view().unwrap(), true)?;
                 Ok(())
             }
             Err((err, resource)) => {
-                gas_meter.charge_move_to(
-                    is_generic,
-                    TypeWithLoader { ty, loader },
-                    &resource,
-                    false,
-                )?;
+                gas_meter.charge_move_to::<L>(is_generic, ty, &resource, false)?;
                 Err(err)
             }
         }
@@ -521,10 +505,9 @@ impl Interpreter {
     }
 
     #[allow(dead_code)]
-    fn debug_print_frame<B: Write>(
+    fn debug_print_frame<B: Write, L: Loader>(
         &self,
         buf: &mut B,
-        loader: &Loader,
         idx: usize,
         frame: &Frame,
     ) -> PartialVMResult<()> {
@@ -539,7 +522,7 @@ impl Interpreter {
         let ty_args = frame.ty_args();
         let mut ty_tags = vec![];
         for ty in ty_args {
-            ty_tags.push(loader.type_to_type_tag(ty)?);
+            ty_tags.push(L::type_to_type_tag(ty)?);
         }
         if !ty_tags.is_empty() {
             debug_write!(buf, "<")?;
@@ -585,14 +568,13 @@ impl Interpreter {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn debug_print_stack_trace<B: Write>(
+    pub(crate) fn debug_print_stack_trace<B: Write, L: Loader>(
         &self,
         buf: &mut B,
-        loader: &Loader,
     ) -> PartialVMResult<()> {
         debug_writeln!(buf, "Call Stack:")?;
         for (i, frame) in self.call_stack.0.iter().enumerate() {
-            self.debug_print_frame(buf, loader, i, frame)?;
+            self.debug_print_frame::<L>(buf, i, frame)?;
         }
         debug_writeln!(buf, "Operand Stack:")?;
         for (idx, val) in self.operand_stack.0.iter().enumerate() {
@@ -807,12 +789,12 @@ impl Frame {
     /// Execute a Move function until a return or a call opcode is found.
     fn execute_code(
         &mut self,
-        resolver: &Resolver,
+        binary_type: &BinaryType,
         interpreter: &mut Interpreter,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
     ) -> VMResult<ExitCode> {
-        self.execute_code_impl(resolver, interpreter, data_store, gas_meter)
+        self.execute_code_impl(binary_type, interpreter, data_store, gas_meter)
             .map_err(|e| {
                 e.at_code_offset(self.function.index(), self.pc)
                     .finish(self.location())
@@ -821,33 +803,34 @@ impl Frame {
 
     fn execute_code_impl(
         &mut self,
-        resolver: &Resolver,
+        binary_type: &BinaryType,
         interpreter: &mut Interpreter,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
     ) -> PartialVMResult<ExitCode> {
         use SimpleInstruction as S;
-
+        // TODO replace make_ty to ty, then use the Loader type
         macro_rules! make_ty {
             ($ty: expr) => {
-                TypeWithLoader {
-                    ty: $ty,
-                    loader: resolver.loader(),
-                }
+                // TypeWithLoader {
+                //     ty: $ty,
+                //     loader: resolver.loader(),
+                // }
+                $ty
             };
         }
 
         let code = self.function.code();
         loop {
             for instruction in &code[self.pc as usize..] {
-                trace!(
-                    &self.function,
-                    &self.locals,
-                    self.pc,
-                    instruction,
-                    resolver,
-                    interpreter
-                );
+                // trace!(
+                //     &self.function,
+                //     &self.locals,
+                //     self.pc,
+                //     instruction,
+                //     resolver,
+                //     interpreter
+                // );
 
                 fail_point!("move_vm::interpreter_loop", |_| {
                     Err(
@@ -898,7 +881,7 @@ impl Frame {
                         interpreter.operand_stack.push(Value::u128(*int_const))?;
                     }
                     Bytecode::LdConst(idx) => {
-                        let constant = resolver.constant_at(*idx);
+                        let constant = binary_type.constant_at(*idx);
                         gas_meter.charge_ld_const(NumBytes::new(constant.data.len() as u64))?;
                         interpreter.operand_stack.push(
                             Value::deserialize_constant(constant).ok_or_else(|| {
@@ -959,7 +942,7 @@ impl Frame {
                         gas_meter.charge_simple_instr(instr)?;
 
                         let reference = interpreter.operand_stack.pop_as::<StructRef>()?;
-                        let offset = resolver.field_offset(*fh_idx);
+                        let offset = binary_type.field_offset(*fh_idx);
                         let field_ref = reference.borrow_field(offset)?;
                         interpreter.operand_stack.push(field_ref)?;
                     }
@@ -972,12 +955,12 @@ impl Frame {
                         gas_meter.charge_simple_instr(instr)?;
 
                         let reference = interpreter.operand_stack.pop_as::<StructRef>()?;
-                        let offset = resolver.field_instantiation_offset(*fi_idx);
+                        let offset = binary_type.field_instantiation_offset(*fi_idx);
                         let field_ref = reference.borrow_field(offset)?;
                         interpreter.operand_stack.push(field_ref)?;
                     }
                     Bytecode::Pack(sd_idx) => {
-                        let field_count = resolver.field_count(*sd_idx);
+                        let field_count = binary_type.field_count(*sd_idx);
                         gas_meter.charge_pack(
                             false,
                             interpreter.operand_stack.last_n(field_count as usize)?,
@@ -988,7 +971,7 @@ impl Frame {
                             .push(Value::struct_(Struct::pack(args)))?;
                     }
                     Bytecode::PackGeneric(si_idx) => {
-                        let field_count = resolver.field_instantiation_count(*si_idx);
+                        let field_count = binary_type.field_instantiation_count(*si_idx);
                         gas_meter.charge_pack(
                             true,
                             interpreter.operand_stack.last_n(field_count as usize)?,
@@ -1160,79 +1143,37 @@ impl Frame {
                     Bytecode::MutBorrowGlobal(sd_idx) | Bytecode::ImmBorrowGlobal(sd_idx) => {
                         let is_mut = matches!(instruction, Bytecode::MutBorrowGlobal(_));
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.get_struct_type(*sd_idx);
-                        interpreter.borrow_global(
-                            is_mut,
-                            false,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.get_struct_type(*sd_idx);
+                        interpreter
+                            .borrow_global::<L>(is_mut, false, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::MutBorrowGlobalGeneric(si_idx)
                     | Bytecode::ImmBorrowGlobalGeneric(si_idx) => {
                         let is_mut = matches!(instruction, Bytecode::MutBorrowGlobalGeneric(_));
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
-                        interpreter.borrow_global(
-                            is_mut,
-                            true,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.instantiate_generic_type(*si_idx, self.ty_args())?;
+                        interpreter
+                            .borrow_global::<L>(is_mut, true, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::Exists(sd_idx) => {
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.get_struct_type(*sd_idx);
-                        interpreter.exists(
-                            false,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.get_struct_type(*sd_idx);
+                        interpreter.exists::<L>(false, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::ExistsGeneric(si_idx) => {
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
-                        interpreter.exists(
-                            true,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.instantiate_generic_type(*si_idx, self.ty_args())?;
+                        interpreter.exists::<L>(true, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::MoveFrom(sd_idx) => {
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.get_struct_type(*sd_idx);
-                        interpreter.move_from(
-                            false,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.get_struct_type(*sd_idx);
+                        interpreter.move_from::<L>(false, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::MoveFromGeneric(si_idx) => {
                         let addr = interpreter.operand_stack.pop_as::<AccountAddress>()?;
-                        let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
-                        interpreter.move_from(
-                            true,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                        )?;
+                        let ty = binary_type.instantiate_generic_type(*si_idx, self.ty_args())?;
+                        interpreter.move_from::<L>(true, gas_meter, data_store, addr, &ty)?;
                     }
                     Bytecode::MoveTo(sd_idx) => {
                         let resource = interpreter.operand_stack.pop()?;
@@ -1242,17 +1183,10 @@ impl Frame {
                             .value_as::<Reference>()?
                             .read_ref()?
                             .value_as::<AccountAddress>()?;
-                        let ty = resolver.get_struct_type(*sd_idx);
+                        let ty = binary_type.get_struct_type(*sd_idx);
                         // REVIEW: Can we simplify Interpreter::move_to?
-                        interpreter.move_to(
-                            false,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                            resource,
-                        )?;
+                        interpreter
+                            .move_to::<L>(false, gas_meter, data_store, addr, &ty, resource)?;
                     }
                     Bytecode::MoveToGeneric(si_idx) => {
                         let resource = interpreter.operand_stack.pop()?;
@@ -1262,16 +1196,9 @@ impl Frame {
                             .value_as::<Reference>()?
                             .read_ref()?
                             .value_as::<AccountAddress>()?;
-                        let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
-                        interpreter.move_to(
-                            true,
-                            resolver.loader(),
-                            gas_meter,
-                            data_store,
-                            addr,
-                            &ty,
-                            resource,
-                        )?;
+                        let ty = binary_type.instantiate_generic_type(*si_idx, self.ty_args())?;
+                        interpreter
+                            .move_to::<L>(true, gas_meter, data_store, addr, &ty, resource)?;
                     }
                     Bytecode::FreezeRef => {
                         gas_meter.charge_simple_instr(S::FreezeRef)?;
@@ -1287,7 +1214,7 @@ impl Frame {
                         gas_meter.charge_simple_instr(S::Nop)?;
                     }
                     Bytecode::VecPack(si, num) => {
-                        let ty = resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = binary_type.instantiate_single_type(*si, self.ty_args())?;
                         gas_meter.charge_vec_pack(
                             make_ty!(&ty),
                             interpreter.operand_stack.last_n(*num as usize)?,
@@ -1298,18 +1225,16 @@ impl Frame {
                     }
                     Bytecode::VecLen(si) => {
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
-                        gas_meter.charge_vec_len(TypeWithLoader {
-                            ty,
-                            loader: resolver.loader(),
-                        })?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
+                        // TODO set associate type to gas_meter or through type
+                        gas_meter.charge_vec_len(ty)?;
                         let value = vec_ref.len(ty)?;
                         interpreter.operand_stack.push(value)?;
                     }
                     Bytecode::VecImmBorrow(si) => {
                         let idx = interpreter.operand_stack.pop_as::<u64>()? as usize;
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = binary_type.instantiate_single_type(*si, self.ty_args())?;
                         let res = vec_ref.borrow_elem(idx, &ty);
                         gas_meter.charge_vec_borrow(false, make_ty!(&ty), res.is_ok())?;
                         interpreter.operand_stack.push(res?)?;
@@ -1317,7 +1242,7 @@ impl Frame {
                     Bytecode::VecMutBorrow(si) => {
                         let idx = interpreter.operand_stack.pop_as::<u64>()? as usize;
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
                         let res = vec_ref.borrow_elem(idx, ty);
                         gas_meter.charge_vec_borrow(true, make_ty!(ty), res.is_ok())?;
                         interpreter.operand_stack.push(res?)?;
@@ -1325,20 +1250,20 @@ impl Frame {
                     Bytecode::VecPushBack(si) => {
                         let elem = interpreter.operand_stack.pop()?;
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
                         gas_meter.charge_vec_push_back(make_ty!(ty), &elem)?;
                         vec_ref.push_back(elem, ty)?;
                     }
                     Bytecode::VecPopBack(si) => {
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
                         let res = vec_ref.pop(ty);
                         gas_meter.charge_vec_pop_back(make_ty!(ty), res.as_ref().ok())?;
                         interpreter.operand_stack.push(res?)?;
                     }
                     Bytecode::VecUnpack(si, num) => {
                         let vec_val = interpreter.operand_stack.pop_as::<Vector>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
                         gas_meter.charge_vec_unpack(make_ty!(ty), NumArgs::new(*num))?;
                         let elements = vec_val.unpack(ty, *num)?;
                         for value in elements {
@@ -1349,7 +1274,7 @@ impl Frame {
                         let idx2 = interpreter.operand_stack.pop_as::<u64>()? as usize;
                         let idx1 = interpreter.operand_stack.pop_as::<u64>()? as usize;
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
+                        let ty = &binary_type.instantiate_single_type(*si, self.ty_args())?;
                         gas_meter.charge_vec_swap(make_ty!(ty))?;
                         vec_ref.swap(idx1, idx2, ty)?;
                     }
@@ -1377,8 +1302,8 @@ impl Frame {
         &self.ty_args
     }
 
-    fn resolver<'a>(&self, loader: &'a Loader) -> Resolver<'a> {
-        self.function.get_resolver(loader)
+    fn binary_type<L: Loader>(&self) -> BinaryType {
+        self.function.get_binary_type::<L>()
     }
 
     fn location(&self) -> Location {
